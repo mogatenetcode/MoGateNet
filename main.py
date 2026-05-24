@@ -1,0 +1,269 @@
+import os
+import sys
+import argparse
+from datetime import datetime
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from monai.inferers import SlidingWindowInferer
+from monai.losses.dice import DiceLoss
+from monai.losses import FocalLoss
+from monai.metrics import DiceMetric, HausdorffDistanceMetric
+from monai.utils.enums import MetricReduction
+
+from utils.data_utils import get_loader
+from mogatenet.trainer import Trainer, Validator
+from mogatenet.losses import CombinedLoss
+from mogatenet.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
+from mogatenet.model.mogatenet import MoGateNet
+
+
+parser = argparse.ArgumentParser(
+    description="MoGateNet training pipeline for multimodal brain tumor segmentation"
+)
+
+parser.add_argument("--logdir", default="mogatenet", type=str, help="directory to save logs and checkpoints")
+parser.add_argument("--checkpoint", default=None, type=str, help="path to checkpoint")
+parser.add_argument("--fold", default=3, type=int, help="data fold")
+
+parser.add_argument("--data_dirs", default="./TrainingData", type=str, help="dataset directory")
+parser.add_argument("--json_list", default="./brats2020_datajson.json", type=str, help="dataset json file")
+
+parser.add_argument("--max_epochs", default=300, type=int, help="maximum number of training epochs")
+parser.add_argument("--batch_size", default=1, type=int, help="batch size")
+parser.add_argument("--sw_batch_size", default=4, type=int, help="sliding window batch size")
+
+parser.add_argument("--optim_lr", default=2.5e-4, type=float, help="learning rate")
+parser.add_argument("--optim_name", default="adamw", type=str, help="optimizer name: adam, adamw, or sgd")
+parser.add_argument("--reg_weight", default=1e-4, type=float, help="weight decay")
+parser.add_argument("--momentum", default=0.99, type=float, help="momentum for SGD")
+
+parser.add_argument("--val_every", default=10, type=int, help="validation frequency")
+parser.add_argument("--distributed", action="store_true", help="enable distributed training")
+parser.add_argument("--world_size", default=1, type=int, help="world size for distributed training")
+parser.add_argument("--rank", default=0, type=int, help="node rank for distributed training")
+parser.add_argument("--dist-url", default="tcp://127.0.0.1:23456", type=str, help="distributed url")
+parser.add_argument("--dist-backend", default="nccl", type=str, help="distributed backend")
+
+parser.add_argument("--norm_name", default="instance", type=str, help="normalization method")
+parser.add_argument("--workers", default=4, type=int, help="number of data loading workers")
+
+parser.add_argument("--in_channels", default=4, type=int, help="number of input modalities")
+parser.add_argument("--out_channels", default=3, type=int, help="number of output channels")
+
+parser.add_argument("--roi_x", default=128, type=int)
+parser.add_argument("--roi_y", default=128, type=int)
+parser.add_argument("--roi_z", default=128, type=int)
+
+parser.add_argument("--infer_overlap", default=0.625, type=float)
+parser.add_argument("--lrschedule", default="warmup_cosine", type=str)
+parser.add_argument("--warmup_epochs", default=30, type=int)
+
+
+def post_pred_func(pred):
+    if isinstance(pred, (tuple, list)):
+        pred = pred[0]
+    pred = torch.sigmoid(pred)
+    pred = (pred > 0.5).float()
+    return pred
+
+
+def setup_logger(logdir):
+    os.makedirs(logdir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_path = os.path.join(logdir, f"train_log_{timestamp}.txt")
+
+    class Tee:
+        def __init__(self, filename):
+            self.file = open(filename, "w", encoding="utf-8")
+            self.stdout = sys.stdout
+            sys.stdout = self
+
+        def write(self, data):
+            self.file.write(data)
+            self.stdout.write(data)
+
+        def flush(self):
+            self.file.flush()
+            self.stdout.flush()
+
+    Tee(log_file_path)
+
+
+def main():
+    args = parser.parse_args()
+
+    os.makedirs("./runs", exist_ok=True)
+    args.logdir = os.path.join("./runs", args.logdir)
+    setup_logger(args.logdir)
+
+    if args.distributed:
+        args.ngpus_per_node = torch.cuda.device_count()
+        print("Found total GPUs:", args.ngpus_per_node)
+        args.world_size = args.ngpus_per_node * args.world_size
+        mp.spawn(main_worker, nprocs=args.ngpus_per_node, args=(args,))
+    else:
+        main_worker(gpu=0, args=args)
+
+
+def main_worker(gpu, args):
+    if args.distributed:
+        torch.multiprocessing.set_start_method("spawn", force=True)
+
+    np.set_printoptions(formatter={"float": "{: 0.3f}".format}, suppress=True)
+
+    args.gpu = gpu
+
+    if args.distributed:
+        args.rank = args.rank * args.ngpus_per_node + gpu
+        dist.init_process_group(
+            backend=args.dist_backend,
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=args.rank,
+        )
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
+        device = torch.device(f"cuda:{args.gpu}")
+    else:
+        device = torch.device("cpu")
+
+    torch.backends.cudnn.benchmark = True
+
+    train_loader, val_loader = get_loader(args)
+    inf_size = [args.roi_x, args.roi_y, args.roi_z]
+
+    model = MoGateNet(
+        model_num=args.in_channels,
+        out_channels=args.out_channels,
+        image_size=inf_size,
+        window_size=(4, 4, 4),
+    )
+
+    pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Total trainable parameters:", pytorch_total_params)
+
+    model = model.to(device)
+
+    best_acc = 0
+    start_epoch = 0
+
+    if args.checkpoint is not None:
+        checkpoint = torch.load(args.checkpoint, map_location="cpu")
+
+        state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        model.load_state_dict(state_dict, strict=False)
+
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"]
+        if "best_acc" in checkpoint:
+            best_acc = checkpoint["best_acc"]
+
+        print(f"=> loaded checkpoint '{args.checkpoint}' epoch={start_epoch}, best_acc={best_acc}")
+
+    if args.distributed:
+        if args.norm_name == "batch":
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            output_device=args.gpu,
+        )
+
+    if args.optim_name == "adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=args.optim_lr,
+            weight_decay=args.reg_weight,
+        )
+    elif args.optim_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.optim_lr,
+            weight_decay=args.reg_weight,
+        )
+    elif args.optim_name == "sgd":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=args.optim_lr,
+            momentum=args.momentum,
+            nesterov=True,
+            weight_decay=args.reg_weight,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {args.optim_name}")
+
+    if args.lrschedule == "warmup_cosine":
+        scheduler = LinearWarmupCosineAnnealingLR(
+            optimizer,
+            warmup_epochs=args.warmup_epochs,
+            max_epochs=args.max_epochs,
+        )
+    elif args.lrschedule == "cosine_anneal":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.max_epochs,
+        )
+        if args.checkpoint is not None:
+            scheduler.step(epoch=start_epoch)
+    else:
+        scheduler = None
+
+    window_infer = SlidingWindowInferer(
+        roi_size=inf_size,
+        sw_batch_size=args.sw_batch_size,
+        overlap=args.infer_overlap,
+    )
+
+    dice_metric = DiceMetric(
+        include_background=True,
+        reduction=MetricReduction.MEAN_BATCH,
+        get_not_nans=True,
+    )
+
+    hd95_metric = HausdorffDistanceMetric(
+        include_background=True,
+        reduction=MetricReduction.MEAN_BATCH,
+        percentile=95.0,
+        get_not_nans=True,
+    )
+
+    validator = Validator(
+        args,
+        model,
+        val_loader,
+        class_list=("TC", "WT", "ET"),
+        metric_functions=[["dice", dice_metric], ["hd95", hd95_metric]],
+        sliding_window_infer=window_infer,
+        post_label=None,
+        post_pred=post_pred_func,
+    )
+
+    dice_loss = DiceLoss(to_onehot_y=False, sigmoid=True)
+    focal_loss = FocalLoss()
+    combined_loss = CombinedLoss([dice_loss, focal_loss], weights=[1.0, 1.0])
+
+    trainer = Trainer(
+        args=args,
+        train_loader=train_loader,
+        validator=validator,
+        loss_func=combined_loss,
+    )
+
+    best_acc = trainer.train(
+        model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        start_epoch=start_epoch,
+    )
+
+    return best_acc
+
+
+if __name__ == "__main__":
+    main()
