@@ -1,6 +1,6 @@
 # MoGateNet
 
-**MoGateNet: Modality-Aware Gated Network for Multimodal MRI-Based Brain Tumor Segmentation**
+**MoGateNet: Modality-Gated Cross-Attention Network for Multimodal Brain Tumor Segmentation**
 
 
 ## Contribution
