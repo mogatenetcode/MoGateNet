@@ -59,9 +59,6 @@ python main.py \
   --fold 0 \
   --logdir mogatenet_fold0
 ```
-
-For 5-fold cross-validation, repeat the training by setting `--fold` to `0`, `1`, `2`, `3`, and `4`.
-
 ## Evaluation
 
 The evaluation reports Dice and HD95 scores for TC, WT, and ET.
