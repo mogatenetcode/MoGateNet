@@ -2,7 +2,6 @@
 
 **MoGateNet: Modality-Aware Gated Network for Multimodal MRI-Based Brain Tumor Segmentation**
 
-This is an anonymous implementation of the CIKM 2026 submission, **"MoGateNet: Modality-Aware Gated Network for Multimodal MRI-Based Brain Tumor Segmentation"**.
 
 ## Contribution
 
